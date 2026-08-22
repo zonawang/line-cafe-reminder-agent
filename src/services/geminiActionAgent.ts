@@ -213,7 +213,11 @@ export async function decideCafeAction(input: {
       temperature: 0
     }
   });
-  return parseDecision(response.functionCalls, response.text || '');
+  const functionCalls = response.functionCalls;
+  return parseDecision(
+    functionCalls,
+    functionCalls?.length ? '' : response.text || ''
+  );
 }
 
 export const geminiActionAgentInternals = { parseDecision };
