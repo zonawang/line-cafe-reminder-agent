@@ -1,52 +1,44 @@
 # 我收藏了咖啡廳，還是會忘記去：我和 Codex 讓 LINE Bot 在正確時間主動提醒我
 
-上一篇，我替 Cafe Bot 加上了 Gemini Function Calling。
+上一篇，我替 Cafe Bot 加上了收藏功能。
 
-使用者分享位置、看到附近咖啡廳之後，可以直接說：
+使用者看完附近咖啡廳推薦後，可以直接說「收藏第二間」。Gemini 會理解這句話，再把店家存進 Firestore。
 
-> 收藏第二間。
+後來我也做了 Google Calendar 預填連結。使用者只要說「週六下午兩點去第二間」，Bot 就能把店家和時間先填進行事曆。
 
-Gemini 會理解這句話，選擇正確的工具，再經過 LINE 確認，把店家安全地存進 Firestore。
+但我想到自己平常的使用習慣，突然覺得還少了一塊。
 
-後來我又加上 Google Calendar 預填連結。使用者可以說「下週六下午兩點安排第二間」，Bot 會把店家和時間填進行事曆。
+收藏了，不代表我會記得看；放進 Calendar，也不代表我不會忘記。
 
-做到這裡，功能看起來已經很完整了，但我很快想到一個非常現實的問題：
+如果 Bot 已經知道我要去哪裡、什麼時候去，它能不能在時間快到時，主動傳 LINE 提醒我？
 
-我就算收藏了，也放進行事曆了，還是可能忘記去。
-
-所以這次我想讓 Bot 再往前一步。它不只替我記住咖啡廳，而是可以聽懂：
+所以我接著做了這個功能：
 
 > 週六下午兩點去第二間，提前一小時提醒我。
 
-然後真的在正確時間，主動傳一則 LINE 訊息給我。
-
-這就是這次 Cafe Reminder Agent 的起點。
+看起來只比上一版多了「提醒我」三個字，實際做下去，卻比我原本想的複雜不少。
 
 ---
 
-## 這次真正困難的，不是「提醒」兩個字
+## 我原本以為，這只是一個線上鬧鐘
 
-一開始看起來，定時提醒好像只要把時間存起來，到了再送訊息就好。
+一開始我想得很簡單：把時間存起來，時間到了就傳訊息。
 
-但我和 Codex 把流程拆開後，才發現裡面其實有一整串問題：
+和 Codex 拆解流程後，我才發現裡面藏著很多小問題。
 
-- 使用者說的「週六下午」到底是哪一天、幾點？
-- 「提前一小時」要怎麼換算成真正的提醒時間？
-- Cloud Run 隨時可能縮容，誰負責記得時間到了？
-- 排程任務怎麼證明自己不是外部偽造的請求？
-- LINE API 暫時失敗時，應該怎麼重試？
-- 重試會不會讓同一則提醒傳兩次？
-- 使用者取消提醒時，任務剛好正在執行怎麼辦？
+「週六下午」是哪一天？「提前一小時」要從哪個時間往前算？如果 Cloud Run 半夜縮到 0，誰還記得要叫醒它？如果 LINE API 暫時失敗，重試時會不會傳出兩則一樣的提醒？
 
-所以這次做的，不只是一個計時器，而是一條能被驗證、能重試、也能安全取消的提醒流程。
+還有一個更容易忽略的問題：提醒用的網址放在公開的 Cloud Run 上，怎麼知道打進來的真的是 Google Cloud Tasks，而不是有人在外面亂按？
+
+所以這次真正要做的，不只是一個計時器，而是一條可以安全排程、失敗重試，也能取消的提醒流程。
 
 ---
 
-## Gemini 把自然語言時間，整理成穩定的 Function Call
+## 先讓 Gemini 聽懂「什麼時候提醒」
 
-使用者不會想照固定格式輸入日期。
+使用者不會每次都乖乖輸入 `2026-08-22 14:00`。
 
-他可能會說：
+比較自然的說法通常是：
 
 ```text
 五分鐘後提醒我去第二間
@@ -54,15 +46,17 @@ Gemini 會理解這句話，選擇正確的工具，再經過 LINE 確認，把�
 下星期日晚上提醒我去第三間
 ```
 
-如果全部依靠字串規則處理，很快就會被不同語序、相對日期和模糊時段弄得很複雜。
+如果全部用字串規則處理，不只要判斷「這週」和「下週」，還要面對不同語序。規則很快就會變得又長又難維護。
 
-所以這次我替 Gemini 定義了一個新的工具：
+這次我替 Gemini 定義了一個 Function：
 
 ```text
 schedule_cafe_reminder
 ```
 
-它需要回傳：
+Gemini 收到自然語言後，要整理出四個欄位：哪一間咖啡廳、預計到訪時間、提前幾分鐘提醒，以及預計停留多久。
+
+例如「五分鐘後提醒我去第二間」，它會轉成：
 
 ```json
 {
@@ -73,183 +67,122 @@ schedule_cafe_reminder
 }
 ```
 
-例如「五分鐘後提醒我去第二間」，代表五分鐘後就是提醒與行程時間，因此 `remind_minutes_before` 會是 `0`。
+這裡的 `0` 不是沒有提醒，而是「提醒時間就是五分鐘後」，不需要再從行程時間往前扣。
 
-如果使用者說「週六兩點去，提前一小時提醒」，Gemini 則會把行程時間設為週六 14:00，再回傳提前 60 分鐘。
+我和 Codex 也真的呼叫 Vertex AI Gemini，拿「五分鐘後提醒我去第二間」做測試。模型選中了正確的 Function，店家是第二間，時間也正確往後推了五分鐘。
 
-我和 Codex 還用真實的 Vertex AI Gemini 呼叫測了一次「五分鐘後提醒我去第二間」。模型真的選中了 `schedule_cafe_reminder`，店家編號是 2，時間也正確往後推了五分鐘。
+不過，Gemini 聽懂之後，程式還是會再檢查一次。店家編號必須存在，提醒至少要在 30 秒後，而且不能超過 Cloud Tasks 可排程的 30 天範圍。
 
-這裡仍然維持上一個 Action Agent 的原則：
-
-> Gemini 負責理解使用者想做什麼，後端負責驗證這件事能不能做。
-
-模型回傳之後，程式會再次確認：
-
-- 店家編號是否真的存在
-- 行程與提醒時間是否在未來
-- 提醒是否至少在 30 秒後
-- 排程是否落在 Cloud Tasks 支援的 30 天範圍內
-- 活動長度是否在合理範圍
-
-自然語言可以有彈性，真正進入系統的資料仍然要有邊界。
+我把兩邊的工作分得很清楚：Gemini 負責理解人話，程式負責守規則。
 
 ---
 
-## 為什麼不能直接在 Cloud Run 裡放一個計時器？
+## Cloud Run 會休息，所以需要 Cloud Tasks 幫忙記時間
 
-最直覺的做法，可能是在程式裡使用 `setTimeout`，或每隔一段時間掃描 Firestore。
+最直覺的提醒做法，是在 Node.js 裡放一個 `setTimeout`。
 
-但 Cloud Run 是無狀態的 Serverless 服務。Instance 可以重啟、縮容，甚至在沒有請求時完全消失。
+但 Cloud Run 不是一台會永遠開著的主機。沒有流量時，它可能縮容；Instance 也可能重啟。如果提醒只存在某個 process 的記憶體裡，那個 process 一消失，提醒也會一起消失。
 
-如果提醒被記在某個 process 的記憶體裡，那個 process 一旦不見，提醒也跟著不見。
+這就是我選擇 Google Cloud Tasks 的原因。
 
-所以這次使用 Google Cloud Tasks。
-
-使用者確認後，後端會建立一個 Task，指定未來的執行時間。到了那個時間，由 Cloud Tasks 主動呼叫 Reminder Agent 的任務端點。
+使用者按下確認後，後端會先把 Reminder 存進 Firestore，再交給 Cloud Tasks 一個未來時間。時間到了，Cloud Tasks 會主動呼叫 Reminder Agent，Cloud Run 就算原本縮到 0，也會被這個請求叫醒。
 
 ```text
-LINE 使用者設定提醒
-        ↓
-Firestore 保存 Reminder
-        ↓
-Cloud Tasks 排定執行時間
-        ↓ 時間到
-呼叫 Reminder endpoint
-        ↓
+使用者設定提醒
+    ↓
+Firestore 保存內容
+    ↓
+Cloud Tasks 記住執行時間
+    ↓
+時間到，喚醒 Cloud Run
+    ↓
 LINE Push Message
 ```
 
-這樣即使 Cloud Run 中間縮到 0，Cloud Tasks 到時間仍然會把服務叫醒。
-
-提醒不再依賴某一台機器「一直活著」。
+簡單說，Firestore 記得「要提醒什麼」，Cloud Tasks 記得「什麼時候要做」。
 
 ---
 
-## Cloud Run 是公開的，提醒端點不能跟著毫無防備
+## 公開網址上的任務端點，不能誰都能叫
 
-LINE Webhook 必須能從外部存取，所以整個 Cloud Run service 是公開的。
+LINE Webhook 必須讓 LINE 從外部打進來，所以 Cloud Run service 是公開的。
 
-但提醒任務端點不能因為這樣就接受任何人的請求。否則只要知道 URL，就可能偽造提醒或反覆觸發 Push Message。
+但提醒任務的 endpoint 不應該跟著門戶大開。不然只要有人知道網址，就可能反覆觸發提醒。
 
-這次 Cloud Tasks 在呼叫任務端點時，會附上一個 Google 簽發的 OIDC ID token。
+Codex 在這裡幫我加了一道身分驗證。Cloud Tasks 呼叫 endpoint 時，會帶一張由 Google 簽發的 OIDC ID token。後端收到後，會確認這張 token 是發給目前的 Cloud Run service，而且裡面的 service account 正是我指定的提醒服務身分。
 
-後端會檢查：
+可以把它想成員工證：網址雖然找得到，但沒有正確證件，還是不能進入真正的任務流程。
 
-- Authorization 是否為 Bearer token
-- token 的 audience 是否是目前的 Cloud Run service
-- token 內的 email 是否為指定的 reminder service account
-- `email_verified` 是否為真
+為了驗證它，我們做了兩個方向的測試。
 
-只有身分與目標都正確，任務才會繼續執行。
+直接呼叫 endpoint、沒有帶 token 時，服務回 `401 Unauthorized`；透過 Cloud Tasks 帶著正確 OIDC token 呼叫，則成功回 `204`。
 
-為了確認這條通道真的有效，我和 Codex 建立了一個不包含真實使用者資料的 smoke task。Cloud Tasks 成功產生 OIDC token，受保護端點驗證通過並回傳 `204`。
-
-同一個 endpoint 如果不帶 token 直接呼叫，則會回 `401`。
-
-這是我很喜歡的一個測試：它不只是確認「URL 打得通」，還同時確認正確身分可以進去、沒有身分的人會被擋下來。
+這比單純看到網址回應更讓我安心，因為它同時證明了「對的人進得來，不對的人會被擋下來」。
 
 ---
 
-## Cloud Tasks 會重試，但重試不能變成重複提醒
+## 可以重試，但不能重複提醒
 
-排程服務一定要考慮失敗。
+Cloud Tasks 很重要的一個能力是自動重試。
 
-如果 LINE API 暫時沒有回應，Cloud Tasks 應該重試；但如果第一則訊息其實已經送出，只是後端來不及更新狀態，下一次重試就可能再傳一則一模一樣的提醒。
+假設提醒時間到了，但 LINE API 剛好暫時沒有回應，Cloud Tasks 可以晚一點再試。問題是，如果第一則訊息其實已經送到 LINE，只是後端還沒來得及把 Firestore 標成完成，下一次重試就可能再傳一則。
 
-所以這次用了兩層保護。
+沒有人想在同一分鐘收到兩次「該去喝咖啡囉」。
 
-第一層是 Firestore delivery lock。
+所以這次做了兩層保護。
 
-任務開始時，後端會透過 Transaction 檢查 Reminder 狀態。已經 `sent` 或 `cancelled` 的提醒不會再執行；正在由另一個請求處理的提醒，也不會被同時領走。
+第一層在 Firestore。每次執行前，程式會用 Transaction 取得 Reminder 的處理權。已經送出、已取消，或正在被另一個請求處理的提醒，都不會再執行。
 
-第二層是 LINE Retry Key。
+第二層在 LINE。每一筆 Reminder 都會產生固定的 Retry Key。同一個提醒就算因為 Cloud Tasks 重試，再次呼叫 LINE API，也會使用同一把 key，讓 LINE 知道這不是一個全新的推播要求。
 
-程式會依照 reminder ID 產生一個固定的 UUID。即使 Cloud Tasks 重試，同一筆提醒送給 LINE 時仍然使用相同 Retry Key，而不是每次產生新的值。
-
-```text
-同一筆 Reminder
-    ↓
-固定 Retry Key
-    ↓
-Cloud Tasks 即使重試
-    ↓
-LINE 仍可辨認為同一次 Push 請求
-```
-
-Firestore 負責管理系統內部狀態，LINE Retry Key 則補上外部 API 已接收、但本地狀態還沒更新的灰色地帶。
-
-我原本只想到「失敗要重試」，但 Codex 進一步提醒我：可靠的重試，不只是再做一次，還要讓再做一次不會造成新的問題。
+我原本只想到「失敗要再試一次」，Codex 則提醒我另一半也同樣重要：再試一次時，不能製造新的問題。
 
 ---
 
-## 取消提醒時，先改狀態，再刪除 Task
+## 取消提醒，順序也有差
 
-這一版也支援：
+這一版除了設定提醒，也可以直接說：
 
 ```text
 查看我的提醒
 取消提醒第一個
 ```
 
-取消仍然要經過 LINE 的「確認執行／取消」按鈕，不會因為 Gemini 判斷出取消意圖，就直接刪除資料。
+取消不會立刻執行。Bot 還是會先顯示「確認執行」和「取消」，等使用者確認後才動作。
 
-真正執行時，順序也很重要：
+真正取消時，程式會先把 Firestore 裡的 Reminder 改成 `cancelled`，再向 Cloud Tasks 刪除排程。
 
-```text
-先把 Firestore Reminder 設為 cancelled
-                ↓
-再呼叫 Cloud Tasks 刪除排程
-```
+為什麼要先改資料？
 
-為什麼不是先刪 Task？
+因為刪除 Cloud Task 也可能暫時失敗。如果 Firestore 已經是 `cancelled`，就算那個 Task 後來真的打進來，後端看到狀態後仍會停下，不會傳送 LINE 訊息。
 
-因為刪除 API 可能暫時失敗。如果先把 Firestore 狀態改成 `cancelled`，即使 Task 沒有立刻刪掉、之後仍然打到 endpoint，後端也會在狀態檢查時停止，不會真的推播。
-
-也就是說，資料狀態才是最後一道防線，刪除 Task 則是後續清理。
+我很喜歡這個小設計。它不是期待每一個外部 API 都永遠成功，而是先確保失敗時不會打擾使用者。
 
 ---
 
-## 部署時又遇到一個很像「明明成功，卻還沒完成」的狀況
+## 容器 build 成功，不代表新版已經上線
 
-這次 Cloud Build 顯示映像建置成功，但新的 Cloud Run service 一開始卻沒有出現。
+部署時也出現了一段很真實的小插曲。
 
-如果只看 build 的綠色狀態，很容易以為服務已經上線；但往下查才發現，流程完成了容器建置，卻沒有走完建立 revision 與導流的最後一步。
+Cloud Build 顯示成功，但新的 Cloud Run service 一開始沒有出現。換句話說，容器映像已經做好了，發布流程卻沒有走完最後一步。
 
-Codex 沒有重跑整包工作，而是先確認成功建置的映像，再直接用那份映像完成 Cloud Run deploy。
+如果只看到綠色的 build 狀態，很容易以為一切都完成了。
 
-這讓我再次記住：
+Codex 往下查了 Cloud Build 與 Cloud Run 的實際狀態，確認映像本身沒有問題後，直接用那份映像完成部署，不需要整包重做。
 
-> Build 成功，代表容器準備好了；不一定代表使用者已經連到新版本。
+這次又讓我記住一件事：build 成功，只代表貨打包好了；有沒有真的送到使用者面前，還要另外確認。
 
-後來新服務通過 `/health`、Cloud Tasks OIDC smoke test 和 LINE 官方 Webhook Verify，才把 Webhook 從上一版 Action Agent 切到新的 Reminder Agent。
-
-切換過程仍然保留舊 endpoint；如果 Verify 失敗，就會自動切回去。
+最後，新服務通過了 health check、Cloud Tasks OIDC smoke test 與 LINE 官方 Webhook Verify，Webhook 才從上一版 Action Agent 切到新的 Reminder Agent。如果 Verify 失敗，流程也準備好自動切回舊網址。
 
 ---
 
-## 這次一共驗證了什麼？
+## 這一版怎麼測？
 
-除了 TypeScript build，專案目前有 14 項自動測試，涵蓋：
+專案目前有 14 項自動測試，包含 Function Call 解析、提醒時間換算、30 秒與 30 天邊界、Bearer token、Postback data，以及 LINE Retry Key 是否穩定。
 
-- Gemini Function Call 解析
-- 提前提醒時間計算
-- 0 分鐘 lead time 的快速測試情境
-- 30 秒下限與 30 天上限
-- Postback data
-- Google Calendar 時區
-- Bearer token 格式
-- LINE Retry Key 的穩定性與 UUID 格式
+雲端部分則實際驗證了 Gemini Function Calling、Cloud Tasks Queue、OIDC 身分、Cloud Run health check 和 LINE Webhook。
 
-雲端部分另外確認：
-
-- Cloud Run health check 正常
-- 未帶 OIDC token 的任務請求回 `401`
-- Cloud Tasks 正確身分呼叫回 `204`
-- 真實 Gemini API 能選中 `schedule_cafe_reminder`
-- LINE 官方 Webhook Verify 回 `200 OK`
-- 最新 revision 沒有 error log
-
-最後的實機測試方式很簡單：
+最後在手機上的測試方式很簡單：
 
 ```text
 重新分享位置
@@ -258,31 +191,21 @@ Codex 沒有重跑整包工作，而是先確認成功建置的映像，再直�
 → 等待 LINE 主動傳送提醒
 ```
 
-這條路徑會一次驗證 Gemini、Firestore、Cloud Tasks、OIDC 和 LINE Push Message。
+看起來只是等兩分鐘，背後卻會一次走過 Gemini、Firestore、Cloud Tasks、OIDC 和 LINE Push Message。
 
 ---
 
-## 從會回答，到會在正確時間出現
+## 從記住一家店，到記住未來答應過的事
 
-回頭看，這幾次 Cafe Bot 的進化很有意思：
+回頭看，Cafe Bot 是一小步一小步長出來的。
 
-```text
-會根據位置找咖啡廳
-→ 記得上一輪，可以換一批
-→ 聽懂「收藏第二間」
-→ 幫我準備 Calendar 行程
-→ 在正確時間主動提醒我
-```
+它先學會根據位置找店，接著可以換一批、收藏店家、準備 Calendar 行程，現在又多了在正確時間主動出現的能力。
 
-這次真正新增的，不只是一則 Push Message，而是讓 Bot 有了一個跨越時間的能力。
+這次讓我最有感的，不是 Bot 多傳了一則訊息，而是使用者現在說完一句話就可以離開。系統會把這個約定保存下來，等未來時間到了，再把答應的事情完成。
 
-使用者現在說一句話，系統可以把意圖保存下來，等到未來的某一刻，再可靠地完成它。
+我想替這次實作留下一句話：
 
-而要讓這件事真的值得信任，Gemini、Cloud Tasks、Firestore、OIDC 和 LINE Retry Key 缺一不可。
-
-我這次最想留下的一句話是：
-
-> 會主動提醒的 Agent，不只是知道現在該回答什麼，也要可靠地記得未來答應過什麼。
+> 會提醒人的 Agent，不只要聽懂現在說了什麼，也要可靠地記得未來答應過什麼。
 
 ---
 
